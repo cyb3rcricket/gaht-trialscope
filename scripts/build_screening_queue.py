@@ -24,6 +24,22 @@ INCLUDE_QUEUE_FILE = DATA / "likely_include_review_queue.csv"
 REPORT_FILE = DATA / "consolidated_screening_queue_report.md"
 
 BATCH_SIZE = 20
+# Candidate-universe size is the Stage 10 freeze contract (see
+# scripts/freeze_dataset.py EXPECTED_CANDIDATES). Screening-progress
+# counts are derived below and must not be snapshotted here.
+CANDIDATE_UNIVERSE = 351
+ALLOWED_STATUSES = {
+    "final_include",
+    "final_exclude",
+    "proposed_include",
+    "proposed_exclude",
+}
+ALLOWED_TIERS = {
+    "0_human_final",
+    "1_sol_promoted",
+    "2_dual_model_agreement",
+    "3_exclude_qc",
+}
 
 
 def clean(value):
@@ -116,6 +132,13 @@ def registry_fields(study):
     }
 
 
+def sol_decision_value(sol):
+    """Read the Sol audit label from current or legacy CSV column names."""
+    if not sol:
+        return ""
+    return clean(sol.get("sol_audit")) or clean(sol.get("sol_decision"))
+
+
 def classify(flash, sol, human):
     if human:
         decision = clean(human.get("human_screening")).lower()
@@ -124,7 +147,7 @@ def classify(flash, sol, human):
         return f"final_{decision}", "0_human_final"
 
     flash_decision = clean(flash.get("ai_triage"))
-    sol_decision = clean(sol.get("sol_decision")) if sol else ""
+    sol_decision = sol_decision_value(sol)
 
     if flash_decision == "human_review" and sol_decision == "likely_include":
         return "proposed_include", "1_sol_promoted"
@@ -144,6 +167,59 @@ def classify(flash, sol, human):
     return "proposed_exclude", "3_exclude_qc"
 
 
+def validate_rows(rows, counts, tiers, human):
+    """Durable queue invariants. Counts move as adjudications are added."""
+    unexpected_status = sorted(set(counts) - ALLOWED_STATUSES)
+    if unexpected_status:
+        raise ValueError(f"Unexpected current_status value(s): {unexpected_status}")
+    unexpected_tier = sorted(set(tiers) - ALLOWED_TIERS)
+    if unexpected_tier:
+        raise ValueError(f"Unexpected priority_tier value(s): {unexpected_tier}")
+
+    if len(rows) != CANDIDATE_UNIVERSE:
+        raise ValueError(f"Expected {CANDIDATE_UNIVERSE} queue rows, found {len(rows)}")
+    if sum(counts.values()) != len(rows):
+        raise ValueError("Status counts do not cover the candidate universe")
+
+    human_final = counts["final_include"] + counts["final_exclude"]
+    if human_final != len(human):
+        raise ValueError(
+            f"Human-final rows ({human_final}) do not match recorded "
+            f"adjudications ({len(human)})"
+        )
+    if tiers["0_human_final"] != len(human):
+        raise ValueError(
+            "Human-final tier count does not match recorded adjudications"
+        )
+    open_rows = counts["proposed_include"] + counts["proposed_exclude"]
+    if open_rows != len(rows) - len(human):
+        raise ValueError("Open queue rows do not match non-adjudicated candidates")
+
+    for row in rows:
+        status = row["current_status"]
+        tier = row["priority_tier"]
+        nct_id = row["nct_id"]
+        has_human = bool(row["human_screening"])
+        if status in {"final_include", "final_exclude"}:
+            if not has_human:
+                raise ValueError(f"{nct_id} is {status} without a human decision")
+            expected = "include" if status == "final_include" else "exclude"
+            if row["human_screening"].lower() != expected:
+                raise ValueError(f"{nct_id} human decision does not match {status}")
+            if tier != "0_human_final":
+                raise ValueError(f"{nct_id} human-final row has tier {tier}")
+            continue
+        if has_human:
+            raise ValueError(f"{nct_id} has a human decision but status {status}")
+        if status == "proposed_include" and tier not in {
+            "1_sol_promoted",
+            "2_dual_model_agreement",
+        }:
+            raise ValueError(f"{nct_id} proposed include has tier {tier}")
+        if status == "proposed_exclude" and tier != "3_exclude_qc":
+            raise ValueError(f"{nct_id} proposed exclude has tier {tier}")
+
+
 def build_rows():
     flash = load_csv(FLASH_FILE)
     sol = load_csv(SOL_FILE)
@@ -151,8 +227,10 @@ def build_rows():
     registry = load_registry()
 
     candidate_ids = set(flash)
-    if len(candidate_ids) != 351:
-        raise ValueError(f"Expected 351 Flash candidates, found {len(candidate_ids)}")
+    if len(candidate_ids) != CANDIDATE_UNIVERSE:
+        raise ValueError(
+            f"Expected {CANDIDATE_UNIVERSE} Flash candidates, found {len(candidate_ids)}"
+        )
     if set(registry) != candidate_ids:
         missing_registry = sorted(candidate_ids - set(registry))
         extra_registry = sorted(set(registry) - candidate_ids)
@@ -189,7 +267,7 @@ def build_rows():
                 "flash_confidence": clean(f.get("ai_confidence")),
                 "flash_reason": clean(f.get("ai_triage_reason")),
                 "flash_evidence": clean(f.get("evidence_snippet")),
-                "sol_decision": clean(s.get("sol_decision")),
+                "sol_decision": sol_decision_value(s),
                 "sol_criterion_1_tgd_population": clean(s.get("criterion_1_tgd_population")),
                 "sol_criterion_2_gaht_research_role": clean(s.get("criterion_2_gaht_research_role")),
                 "sol_boundary_reason": clean(s.get("boundary_reason")),
@@ -206,8 +284,8 @@ def build_rows():
             }
         )
 
-    # Put the active include-verification work first: 17 Sol-promoted records,
-    # then the 111 dual-model agreements. Number only those 128 active rows.
+    # Number any remaining proposed-include rows for verification order.
+    # After completed human screening this set is empty.
     rows.sort(key=lambda r: (r["priority_tier"], r["nct_id"]))
     include_order = 0
     for row in rows:
@@ -218,25 +296,7 @@ def build_rows():
 
     counts = Counter(row["current_status"] for row in rows)
     tiers = Counter(row["priority_tier"] for row in rows)
-
-    expected = {
-        "final_exclude": 13,
-        "proposed_include": 128,
-        "proposed_exclude": 210,
-    }
-    for key, value in expected.items():
-        if counts[key] != value:
-            raise ValueError(f"Expected {value} {key} rows, found {counts[key]}")
-    if tiers["1_sol_promoted"] != 17:
-        raise ValueError(
-            f"Expected 17 Sol-promoted includes, found {tiers['1_sol_promoted']}"
-        )
-    if tiers["2_dual_model_agreement"] != 111:
-        raise ValueError(
-            "Expected 111 dual-model likely-includes, "
-            f"found {tiers['2_dual_model_agreement']}"
-        )
-
+    validate_rows(rows, counts, tiers, human)
     return rows, counts, tiers
 
 
