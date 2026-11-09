@@ -1,0 +1,13 @@
+# Secrets — never commit real env files (added Nov 9, 2026, Proof of Ship sweep)
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# OS junk
+.DS_Store
